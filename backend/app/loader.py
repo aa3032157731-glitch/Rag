@@ -84,6 +84,47 @@ def json_documents(source, raw):
         documents.append(make_document(source, title.strip(), '', key, '\n'.join(parts)))
     return documents
 
+def load_documents(root: Path) -> LoadReport:
+    root = root.resolve()
+    report = LoadReport()
+    if not root.is_dir():
+        report.errors.append(f'资料目录不存在{root}')
+        return report
+    for path in sorted(root.rglob('*')):
+        if not path.is_file():
+            continue
+        source = path.relative_to(root).as_posix()
+        if path.suffix.lower() not in ('.txt', '.md', '.json'):
+            report.skipped.append(source + ':格式不支持')
+            continue
+        try:
+            raw = path.read_text(encoding='utf-8-sig')
+            if not raw.strip():
+                raise ValueError('文件为空')
+            if path.suffix.lower() == '.md':
+                docs = markdown_documents(source, raw)
+            elif path.suffix.lower() == '.json':
+                docs = json_documents(source, raw)
+            else:
+                docs = [make_document(source, path.stem, '', 'text', raw)]
+            if not docs:
+                ValueError('没有可导入的正文')
+            report.documents.extend(docs)
+            report.files[source] = digest(raw)
+        except (OSError, UnicodeError, ValueError) as exc:
+            report.errors.append(f'{source}: {exc}')
+    return report
+
+if __name__ == '__main__':
+    from backend.app.config import load_settings
+    report = load_documents(load_settings().documents_dir)
+    for doc in report.documents:
+        print(f'{doc.source} | {doc.record_key} | {len(doc.text)}字')
+        print(doc.text)
+    print('文件数: ', len(report.files), '文档单元: ', len(report.documents))
+    print('跳过: ', report.skipped, '错误: ', report.errors)
+    raise SystemExit(1 if report.errors else 0)
+
 
 
 
