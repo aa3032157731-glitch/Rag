@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=ROOT / 'backend' /'.env',
         env_file_encoding='utf-8',
-        extra='forbid'
+        extra='forbid',
     )
     documents_dir: Path = Path('data/documents')
     model_cache: Path = Path('models/huggingface')
