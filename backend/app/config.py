@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     max_tokens: int = 1024
     chunk_size: int = 600
     chunk_overlap: int = 100
-    qdrant_url: str = 'http//127.0.0.1:6333'
+    qdrant_url: str = 'http://127.0.0.1:6333'
     qdrant_alias: str = 'rag_active'
     top_k: int = 5
     max_context_chars: int = 4000

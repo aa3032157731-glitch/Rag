@@ -1,26 +1,30 @@
 # Step 08：编写 FastAPI 检索接口
 
-## 目标与前置条件
+> **本节改动说明**：全局异常中间件记录日志时，除了原来的 `request_id`，现在还会带上 `method` 和 `path`。以前排查一条报错日志得先反查 `request_id` 才知道是哪个接口出的问题，现在日志里直接就有。其余接口行为、返回结构与原教程完全一致。
 
-完成 step07 并退出 CLI；Qdrant 保持运行。本篇不新增检索算法，只把已经跑通的 Retriever 包装成 HTTP 接口。
+## 本节目标
 
-HTTP 不代表互联网。`127.0.0.1` 是本机；服务启动后 Unity 可以向它发送 JSON。
+完成后你能：通过浏览器或任何 HTTP 客户端调用 `/retrieve`，得到和 step07 命令行一致的检索结果；服务未就绪、参数错误、并发过载这几种情况都有明确区分的状态码。
 
-## 1. 确定接口契约
+**前置条件**：完成 step07 并退出 CLI，Qdrant 保持运行。本篇不新增任何检索算法，只是把已经跑通的 `Retriever` 包装成 HTTP 接口。
 
-新建 `docs/api-contract.md`，填写下列约定（这是文档，不是 Python）：
+`127.0.0.1` 指的是本机，不是互联网——搞清楚这一点，后面 Unity 通过 HTTP 调用这个服务时才不会有"是不是要联网"的疑惑。
+
+## 一、先确定接口契约
+
+新建 `docs/api-contract.md`（这是一份文档，不是代码），先把约定写清楚再动手实现，能少走很多弯路：
 
 | 方法与地址 | 行为 |
 | --- | --- |
-| `GET /health` | 进程可响应，返回 `status=alive` |
-| `GET /ready` | 模型和活动索引可用才返回 200，否则 503 |
-| `POST /retrieve` | 请求包含 query、top_k，返回结果、版本与耗时 |
+| `GET /health` | 进程能响应就返回 `status=alive`，不检查依赖 |
+| `GET /ready` | 模型和活动索引都可用才返回 200，否则 503 |
+| `POST /retrieve` | 请求包含 `query`、`top_k`，返回结果、索引版本和各阶段耗时 |
 
-成功结果字段：`request_id`、`status`、`query`、`index_version`、`results`、`timings_ms`。results 内有 `chunk_id/source/title/section/record_key/text/score`。
+成功响应字段：`request_id`、`status`、`query`、`index_version`、`results`、`timings_ms`；`results` 里每条包含 `chunk_id`/`source`/`title`/`section`/`record_key`/`text`/`score`。
 
-无匹配使用 200 + `status=no_match` + 空 results。错误使用非 2xx 状态码以及 `{"request_id":"...","error":{"code":"...","message":"..."}}`，不混入成功结构。
+**无匹配**用 200 + `status=no_match` + 空 `results`。**错误**用非 2xx 状态码，body 为 `{"request_id":"...","error":{"code":"...","message":"..."}}`——这两种结构绝对不能混用，客户端要能一眼判断"这次调用到底算不算成功"。
 
-## 2. 新建 `backend/app/schemas.py`
+## 二、新建 `backend/app/schemas.py`
 
 <!-- file: backend/app/schemas.py -->
 ```python
@@ -67,9 +71,9 @@ class RetrieveResponse(BaseModel):
     timings_ms: Timings
 ```
 
-`strict=True` 防止 `true`、`"5"` 被当成合法 top_k。`extra='forbid'` 让拼错字段得到明确错误，不悄悄忽略。
+`strict=True` 能防止 `true`、`"5"` 这类值被当成合法的 `top_k`（Pydantic 默认的"宽松"模式会尝试把字符串转成数字，strict 模式关掉这种自动转换）。`extra='forbid'` 让请求里如果不小心拼错字段名，会得到明确的 422 错误，而不是被悄悄忽略。
 
-## 3. 新建 `backend/app/main.py`
+## 三、新建 `backend/app/main.py`
 
 <!-- file: backend/app/main.py -->
 ```python
@@ -127,14 +131,18 @@ def create_app(injected_retriever=None):
         try:
             response = await call_next(request)
         except Exception:
-            logger.exception('未处理异常 request_id=%s', request.state.request_id)
+            # 带上 method/path，排查时不用先反查 request_id 才知道是哪个接口报的错。
+            logger.exception(
+                '未处理异常 request_id=%s method=%s path=%s',
+                request.state.request_id, request.method, request.url.path,
+            )
             response = failure(request, 500, 'internal_error', '服务内部错误，请查看 request_id 对应日志')
         response.headers['X-Request-ID'] = request.state.request_id
         return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
-        # 不回显整个问题或输入，防止意外记录私人文本。
+        # 不回显整个问题或输入内容，防止意外把私人文本记进日志。
         return failure(request, 422, 'invalid_request', 'query 必须为非空文字，top_k 必须为 1～10 的整数')
 
     @app.get('/health')
@@ -174,17 +182,17 @@ def create_app(injected_retriever=None):
 app = create_app()
 ```
 
-### 关键解释
+## 四、关键代码解读
 
-- lifespan 在服务开始接受请求前加载模型。首次下载期间 `/health` 也还不能响应，等终端出现启动完成提示后再检查。
-- 重型初始化失败时服务仍能报告 health，但 ready=503。模型初始化失败需修复并重启；仅 Qdrant 暂时停止时，恢复数据库后 ready 可恢复。
-- 同步 `def` 路由在线程池执行阻塞检索；一把锁限制单次推理，第二个并发请求得到 429，而不是无限排队。
-- HTTP 断开不保证终止已经启动的推理，因此 Unity 仍需处理迟到结果。
-- `create_app(injected_retriever)` 允许测试注入假检索器，不下载模型。生产启动时不传入它。
+- **lifespan 在服务真正开始接受请求之前加载模型**：首次下载期间连 `/health` 都还不会响应，等终端里出现启动完成的提示后再去检查。
+- **初始化失败不等于进程崩溃**：`lifespan` 里 `except Exception` 只是记录日志，`app.state.retriever` 保持 `None`——这样 `/health` 还能正常返回，方便你确认"进程活着，但模型没起来"，而 `/ready` 会明确返回 503。
+- **单把锁 = 单次推理**：因为整个进程只有一份模型实例（内存有限），这里用一把 `Lock` 保证同一时刻只处理一个 `/retrieve` 请求，第二个并发请求会立刻拿到 429，而不是排队等到超时——这是"明确拒绝"优于"隐式变慢"的一个例子。如果以后想支持更高并发，需要先解决"多份模型实例的显存/内存开销"这个前提问题，不是简单加大锁的粒度就能解决的。
+- **HTTP 断开不等于计算停止**：Python 后端已经开始的推理不会因为客户端断开连接就立刻终止，所以 Unity 那边（step10）仍然需要自己处理"迟到的结果"。
+- **`create_app(injected_retriever)`**：允许测试注入一个假的检索器，跳过真实模型加载；正式启动时不传这个参数。
 
-参考：[FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/)、[同步/异步路由](https://fastapi.tiangolo.com/async/)。
+参考文档：[FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/)、[同步/异步路由](https://fastapi.tiangolo.com/async/)。
 
-## 4. 新建接口测试
+## 五、新建接口测试
 
 文件：`backend/tests/test_api.py`。
 
@@ -242,24 +250,24 @@ if __name__ == '__main__':
     unittest.main()
 ```
 
-## 5. 运行服务
+## 六、运行服务
 
-终端 A 先跑测试，再启动服务。不要启用 `--reload` 或多个 workers，以免重复加载模型：
+终端 A 先跑测试，再启动服务。不要加 `--reload`、也不要开多个 worker，否则会重复加载模型：
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest backend.tests.test_api -v
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-保持终端 A 运行。浏览器打开 `http://127.0.0.1:8000/docs`，展开 POST `/retrieve` → Try it out，填写：
+保持这个终端运行，浏览器打开 `http://127.0.0.1:8000/docs`，展开 `POST /retrieve` → Try it out，填入：
 
 ```json
 {"query":"图书馆几点关门？","top_k":5}
 ```
 
-点击 Execute，应该得到包含开放时间原文的 results。网页自带的 curl 命令不需要复制到 PowerShell。
+点击 Execute，应该能拿到包含开放时间原文的 `results`（网页自带生成的 curl 命令不用管，那是给别的环境用的）。
 
-终端 B 在根目录检查：
+终端 B 在项目根目录检查：
 
 ```powershell
 Invoke-RestMethod 'http://127.0.0.1:8000/health'
@@ -268,19 +276,19 @@ $body = @{query='校园卡补办要带什么'; top_k=5} | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/retrieve' -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
-## 6. 排查与验收
+## 七、排查与验收
 
 | 现象 | 检查与解决 |
 | --- | --- |
-| 8000 无响应 | 等模型加载结束，检查 uvicorn 是否退出或端口占用 |
-| health=200、ready=503 | 看日志；Qdrant、alias、manifest 或模型初始化有问题 |
-| 422 | 请求字段名、类型、空白或 token 上限不合法 |
-| 429 | 模型正忙，等待上次实际推理结束，不要连续重复点击 |
-| 修改 Python 没生效 | 主教程没有 reload，Ctrl+C 后重新启动 |
+| 8000 端口无响应 | 等模型加载完成；检查 uvicorn 是不是意外退出，或端口被占用 |
+| `health=200` 但 `ready=503` | 查日志——大概率是 Qdrant、alias、manifest 或模型初始化出了问题 |
+| 收到 422 | 检查请求字段名、类型、是不是空白字符串，或者问题长度超过上限 |
+| 收到 429 | 模型正忙，等上一次真实推理结束即可，不要连续重复点击加重排队 |
+| 改了 Python 代码没生效 | 本教程没有开 `--reload`，需要 Ctrl+C 后重新启动 |
 
-- [ ] 接口测试通过。
-- [ ] 浏览器、CLI 在相同配置下能得到一致来源。
-- [ ] 错误状态与无匹配状态不同。
-- [ ] 已写明 API 契约，后续 C# 将严格沿用。
+- [ ] 接口测试全部通过。
+- [ ] 浏览器和 CLI 在相同配置下能得到一致的来源。
+- [ ] 错误状态和无匹配状态返回的结构明显不同。
+- [ ] `docs/api-contract.md` 已写好，C# 端会严格照着这份契约来写。
 
 下一篇：[step09：创建 Unity 界面](step09.md)。

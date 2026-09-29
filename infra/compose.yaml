@@ -1,0 +1,13 @@
+name: rag-tutorial
+services:
+  qdrant:
+    image: ${QDRANT_IMAGE:?Please set QDRANT_IMAGE}
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - rag_qdrant_data:/qdrant/storage
+    restart: unless-stopped
+volumes:
+  rag_qdrant_data:
+    name: rag_qdrant_data
+

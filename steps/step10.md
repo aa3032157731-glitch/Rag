@@ -1,20 +1,24 @@
 # Step 10：Unity 调用本机检索接口
 
-## 目标与前置条件
+> **本节改动说明**：C# 代码未做改动——`HttpJson` 里手动用 `Stopwatch` 管理超时、每帧检查取消令牌的写法已经是 `UnityWebRequest` 异步场景下的标准做法；`RetrievalPreview` 里的 `generation` 轮次计数器设计也是正确处理"取消后旧结果不覆盖新界面"的关键机制，不需要改。这里只是重新组织了文档的呈现顺序。
 
-完成 [step09](step09.md)，Unity 场景能显示中文。启动 Docker、Qdrant 和 step08 的 FastAPI，确认 `/ready` 返回 200。
+## 本节目标
 
-本篇仍不调用 DeepSeek，只把真正的检索原文显示在 Unity。先验证 HTTP 和 JSON，再增加聊天模型，排错会容易得多。
+完成后你能：在 Unity 里输入问题，看到从本机 FastAPI 检索到的真实原文和来源，而且断网、超时、取消这几种情况都有明确区分的界面反馈。
 
-## 1. 替换场景中的演示组件
+**前置条件**：完成 [step09](step09.md)，Unity 场景能正常显示中文。启动 Docker、Qdrant 和 step08 的 FastAPI，先用浏览器确认 `/ready` 返回 200。
 
-退出 Unity Play 模式。在 ChatRoot 的 Inspector 中移除 **UiPreview 组件**，保留 ChatUI。源文件 UiPreview.cs 可以保留，但不要再挂载，否则一次发送会被两个组件同时处理。
+本篇仍然不调用 DeepSeek，只把真实检索的原文显示到 Unity 里。**先把 HTTP 和 JSON 这一层跑通，再接聊天模型**——这样如果后面出问题，你能立刻知道是"检索这一层"还是"聊天这一层"的锅，排错会容易得多。
 
-后面创建的普通 DTO、客户端类不挂 GameObject。只有本篇的 `RetrievalPreview` 要挂载。
+## 一、替换场景中的演示组件
 
-## 2. 新建 `Assets/Scripts/RagModels.cs`
+退出 Unity Play 模式。在 `ChatRoot` 的 Inspector 里**移除 UiPreview 组件**，保留 `ChatUI`。`UiPreview.cs` 源文件可以留着，但不要再挂载它，否则一次发送会被两个组件同时处理，界面上会看到重复或冲突的结果。
 
-以下路径相对于 `unity-client`。JSON 使用与 Python 一致的字段名，避免某端写 `topK`，另一端只认识 `top_k`。
+后面新建的 DTO、客户端类都是纯数据/纯逻辑类，不挂 GameObject。只有本篇最后的 `RetrievalPreview` 要挂载。
+
+## 二、新建 `Assets/Scripts/RagModels.cs`
+
+以下路径都相对于 `unity-client`。这里的 JSON 字段名要和 Python 端保持完全一致——一边写 `topK`、另一边只认 `top_k` 是最常见的联调翻车点。
 
 <!-- file: unity-client/Assets/Scripts/RagModels.cs -->
 ```csharp
@@ -74,11 +78,11 @@ public sealed class ApiErrorResponse
 }
 ```
 
-DTO 只有数据，没有 Unity 生命周期函数。不要把每个 DTO 再拆成需要挂载的 MonoBehaviour。
+这些 DTO（数据传输对象）只有字段，没有任何 Unity 生命周期方法——不要把每个 DTO 又拆成一个需要挂载的 `MonoBehaviour`，那是完全不必要的复杂度。
 
-## 3. 新建通用请求封装 `Assets/Scripts/HttpJson.cs`
+## 三、新建通用请求封装 `Assets/Scripts/HttpJson.cs`
 
-它会被检索和 DeepSeek 两个客户端共用。所有调用从 Unity 主线程发起，`Task.Yield()` 续执行时回到 Unity 同步上下文，所以可以安全检查请求、取消和更新 UI。
+这个类会被检索客户端和 step11 的 DeepSeek 客户端共用。所有调用都从 Unity 主线程发起，`await Task.Yield()` 之后会回到 Unity 的同步上下文继续执行，所以可以安全地检查取消状态、更新 UI。
 
 <!-- file: unity-client/Assets/Scripts/HttpJson.cs -->
 ```csharp
@@ -114,7 +118,7 @@ public static class HttpJson
             request.SetRequestHeader("Content-Type", "application/json; charset=utf-8");
             if (!string.IsNullOrWhiteSpace(bearerKey))
                 request.SetRequestHeader("Authorization", "Bearer " + bearerKey.Trim());
-            // 明确拒绝跳转，避免带密钥的请求意外发往其他地址。
+            // 明确拒绝跳转，避免带着密钥的请求意外发往其他地址。
             request.redirectLimit = 0;
             var watch = Stopwatch.StartNew();
             var operation = request.SendWebRequest();
@@ -148,7 +152,7 @@ public static class HttpJson
                     if (!string.IsNullOrWhiteSpace(error?.request_id))
                         message += " [request_id=" + error.request_id + "]";
                 }
-                catch (JsonException) { /* 非 JSON 错误页，只显示状态，不回显全文。 */ }
+                catch (JsonException) { /* 非 JSON 错误页，只显示状态码，不回显全文。 */ }
                 throw new ApiRequestException(request.responseCode, message);
             }
             return body;
@@ -157,16 +161,16 @@ public static class HttpJson
 }
 ```
 
-### 关键解释
+**关键点**：
 
-- `using` 在成功、失败和取消时释放请求与处理器。
-- 自己用 Stopwatch 管理总超时，能把“用户取消”和“等待超时”显示为不同状态。
-- 不通过 `token.Register` 的后台回调直接操作 Unity 对象；每一帧在主线程检查取消。
-- 不使用 `Task.Run` 包住 UnityWebRequest，也不使用 `ConfigureAwait(false)` 后再更新 UI。
-- Abort 终止客户端等待，但不能保证 Python 已经开始的 GPU/CPU 工作立刻停止。
-- 不打印 Authorization、密钥、完整请求正文或完整错误页。
+- `using` 语句保证成功、失败、取消三种情况下请求和处理器都会被正确释放。
+- 用自己的 `Stopwatch` 管理总超时，而不是依赖 `UnityWebRequest` 自带的 `timeout` 属性——这样能把"用户主动取消"和"等待超时"区分成两种不同的界面提示，`UnityWebRequest.timeout` 做不到这一点。
+- 不通过 `token.Register` 的后台回调直接操作 Unity 对象，而是每一帧在主线程里检查取消状态——这是 Unity 异步编程里避免"跨线程访问 UI 对象崩溃"的关键约束。
+- 不用 `Task.Run` 包住 `UnityWebRequest`，也不在 `await` 之后用 `ConfigureAwait(false)`——这两者都会导致后续代码跑到非主线程，从而在更新 UI 时崩溃。
+- `Abort()` 只能终止客户端这边的等待，不能保证 Python 那边已经开始的 CPU/GPU 计算立刻停止。
+- 不打印 Authorization 头、密钥、完整请求体或完整错误页——避免密钥意外出现在日志里。
 
-## 4. 新建 `Assets/Scripts/RagClient.cs`
+## 四、新建 `Assets/Scripts/RagClient.cs`
 
 <!-- file: unity-client/Assets/Scripts/RagClient.cs -->
 ```csharp
@@ -211,9 +215,9 @@ public sealed class RagClient
 }
 ```
 
-不是“HTTP 200 就一定正确”：客户端仍检查 JSON 内容和关键字段，避免把空值一路传给界面。
+**关键点**：这里不是"HTTP 200 就默认一切正确"——客户端还会检查 JSON 内容本身是否自洽（状态和结果数量是否匹配、每条结果是否缺字段），避免把不完整的数据一路传到界面层才崩溃。
 
-## 5. 新建临时 `Assets/Scripts/RetrievalPreview.cs`
+## 五、新建临时 `Assets/Scripts/RetrievalPreview.cs`
 
 <!-- file: unity-client/Assets/Scripts/RetrievalPreview.cs -->
 ```csharp
@@ -285,34 +289,34 @@ public sealed class RetrievalPreview : MonoBehaviour
 }
 ```
 
-`generation` 是轮次编号。旧请求完成时即使没有及时取消，也不能更新新一轮界面。取消源由创建它的异步方法 finally 释放，避免新任务先把旧任务仍在用的资源 dispose。
+**`generation` 是这里最值得记住的设计**：它是一个轮次编号。即使某个旧请求没有被及时取消而是自然完成了，只要它的 `id` 和当前 `generation` 对不上，就说明用户已经开始了新的一轮，旧结果直接丢弃，不更新界面。取消令牌源（`CancellationTokenSource`）由创建它的那次异步调用自己在 `finally` 里释放，避免新任务提前把旧任务还在用的资源 dispose 掉。
 
-## 6. 挂载和测试
+## 六、挂载和测试
 
-1. 在 ChatRoot 添加 `RetrievalPreview`，绑定它的 Ui；确认 UiPreview 已移除。
-2. 启动终端 A 的 FastAPI，浏览器检查 `/ready`。不要同时运行 CLI，因为它会多加载一份 BGE-M3。
-3. Unity Play，输入“图书馆几点关门？”，点击发送。
-4. 回答区域应显示资料原文，来源区域出现 `[S1] campus/library.md` 等来源。顺序和分数可能不同。
-5. 输入带引号的问题，例如 `“图书馆”在哪？`，请求不应因 JSON 拼接错误而失败。
-6. 点击发送后立即取消：状态变“已取消”；等一会儿，旧结果不应突然出现。
-7. 快速发送另一问题：上轮结果不能覆盖下一轮。若后端还忙，可能得到 429；这是有界并发的正常错误，等待后重试。
-8. Ctrl+C 停止 FastAPI，再发送：应显示服务连接失败，而不是“知识库没有答案”。恢复 FastAPI 后可再次发送。
+1. 在 `ChatRoot` 上添加 `RetrievalPreview`，绑定它的 Ui 字段；确认 `UiPreview` 已经移除。
+2. 启动终端 A 的 FastAPI，浏览器检查 `/ready`。**不要**同时运行 CLI，那会多加载一份 BGE-M3，白白占用内存。
+3. Unity Play，输入"图书馆几点关门？"，点发送。
+4. 回答区应该显示资料原文，来源区出现类似 `[S1] campus/library.md` 的来源信息（顺序和分数可能和示例不同，这是正常的）。
+5. 输入带引号的问题，比如 `"图书馆"在哪？`，请求不应该因为 JSON 拼接错误而失败——这验证了用 `JsonConvert` 序列化而不是手工拼字符串的好处。
+6. 点发送后立刻点取消：状态应变成"已取消"；再等一会儿，旧结果不应该突然冒出来。
+7. 快速连续发送两个问题：上一轮的结果不能覆盖下一轮。如果后端还在忙，可能会收到 429，这是有界并发下的正常错误，等一会儿重试即可。
+8. Ctrl+C 停掉 FastAPI 再发送：应该显示服务连接失败，而不是"知识库没有答案"——这是本篇最重要的验收点之一，因为这两种情况对用户的意义完全不同。恢复 FastAPI 后再试一次应该能正常工作。
 
-如 CPU 检索确实较慢，退出 Play，在 Console 显示的本机配置文件中增加 `retrievalTimeoutSeconds`；重新 Play 读取新值。不要通过增加超时掩盖每次重复加载模型的问题。
+如果 CPU 检索确实比较慢，退出 Play，在 Console 打印出的本机配置文件里调大 `retrievalTimeoutSeconds`，重新 Play 生效。不要用"加大超时"去掩盖"每次都在重复加载模型"这种真正的问题。
 
-## 7. 排查与验收
+## 七、排查与验收
 
 | 现象 | 检查与解决 |
 | --- | --- |
-| JsonConvert 找不到 | 确认 step09 安装 Newtonsoft 包，而非随意复制外部 DLL |
-| 422 | C# DTO 是否仍使用 `query` 和 `top_k`，问题是否太长 |
-| 连接失败 | 浏览器直接检查本机 `/ready`，确认地址和端口 |
-| 结果显示两次 | 场景上还挂着 UiPreview 或重复的 RetrievalPreview |
-| 取消后旧文本出现 | 检查每个 await 后的 generation 判断，没有误删 |
+| 找不到 `JsonConvert` | 确认 step09 装好了 Newtonsoft 包，而不是随便复制了外部 DLL |
+| 收到 422 | 检查 C# DTO 是否还是 `query`/`top_k` 这两个字段名，问题是不是太长 |
+| 连接失败 | 直接用浏览器检查本机 `/ready`，确认地址和端口是否一致 |
+| 结果显示了两次 | 场景上可能还挂着 `UiPreview`，或者重复挂载了 `RetrievalPreview` |
+| 取消后旧文本又出现了 | 检查每个 `await` 之后的 `generation` 判断有没有被误删 |
 
-- [ ] Unity 能显示真实原文和来源。
-- [ ] 错误、无匹配、超时、取消可区分。
-- [ ] 旧轮次不覆盖新轮次。
-- [ ] 在此阶段没有填写或调用 DeepSeek 密钥。
+- [ ] Unity 能显示真实的检索原文和来源。
+- [ ] 错误、无匹配、超时、取消四种情况能清楚区分。
+- [ ] 旧一轮结果不会覆盖新一轮。
+- [ ] 这一阶段还没有填写或调用 DeepSeek 的密钥。
 
 下一篇：[step11：接入 DeepSeek，形成完整 RAG](step11.md)。

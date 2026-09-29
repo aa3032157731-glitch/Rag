@@ -37,7 +37,7 @@ def markdown_documents(source, raw):
         buffer.clear()
 
     for line in raw.splitlines():
-        if line.lstrip().startswitch(('```', '~~~')):
+        if line.lstrip().startswith(('```', '~~~')):
             in_fence = not in_fence
         match = None if in_fence else re.match(r'^(#{1,6})\s+(.+?)\s*$', line)
         if not match:
@@ -108,7 +108,7 @@ def load_documents(root: Path) -> LoadReport:
             else:
                 docs = [make_document(source, path.stem, '', 'text', raw)]
             if not docs:
-                ValueError('没有可导入的正文')
+                raise ValueError('没有可导入的正文')
             report.documents.extend(docs)
             report.files[source] = digest(raw)
         except (OSError, UnicodeError, ValueError) as exc:
@@ -124,15 +124,3 @@ if __name__ == '__main__':
     print('文件数: ', len(report.files), '文档单元: ', len(report.documents))
     print('跳过: ', report.skipped, '错误: ', report.errors)
     raise SystemExit(1 if report.errors else 0)
-
-
-
-
-
-
-
-
-
-
-
-

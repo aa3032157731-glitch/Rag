@@ -43,7 +43,7 @@ def boundary_position(
         if minimum <= match.end() <= maximum
     ]
     if candidates:
-        return min(candidates, key=lambda position: - target)
+        return min(candidates, key=lambda position: abs(position - target))
     return fallback
 
 def split_document(doc: Document, size=600, overlap=100) -> list[Chunk]:
@@ -63,7 +63,7 @@ def split_document(doc: Document, size=600, overlap=100) -> list[Chunk]:
     ]
 
 def embedding_text(chunk: Chunk) -> str:
-    return f'{chunk.title[:80]}\n{chunk.section[80]}\n{chunk.text}'
+    return f'{chunk.title[:80]}\n{chunk.section[:80]}\n{chunk.text}'
 
 def fit_token_budget(chunks, count_tokens, limit):
     result = []

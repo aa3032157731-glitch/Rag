@@ -1,20 +1,24 @@
 # Step 11：接入 DeepSeek，完成有来源的 RAG 问答
 
-## 目标与前置条件
+> **本节改动说明**：C# 代码未做改动。这是全教程逻辑最复杂的一篇（两个异步请求、追问补全、引用编号校验），原教程的防御性设计已经很到位（轮次编号、引用编号校验、历史裁剪），改代码风险大于收益。这里主要是把原来分散在各代码块之间的"为什么"集中说明，并在末尾补充了一段"这一篇最容易踩的坑"的速查。
 
-已完成 step10，Unity 能显示检索原文。现在让聊天模型根据资料回答，而不是直接朗读原文。
+## 本节目标
 
-第一版使用 DeepSeek 官方 Chat Completions、非流式请求。Python 仍然只检索，**不增加第二套 `/chat`**。接口和模型名依据 [DeepSeek 官方说明](https://api-docs.deepseek.com/) 核对，日期 2026-09-17；默认 `deepseek-flash`，模型名可在本机配置中修改。
+完成后你能：Unity 输入问题 → 本机检索资料 → DeepSeek 根据资料生成有引用编号的回答 → 界面同时显示回答和可核对的原始来源。**聊天模型只负责组织语言，不负责编造知识库之外的事实**——这是本篇最重要的设计原则，后面所有代码都是在为这一条服务。
 
-## 1. 准备密钥与场景
+**前置条件**：完成 [step10](step10.md)，Unity 能显示检索原文。
 
-1. 在 DeepSeek 官方平台创建自己的 API Key，确认账户可以调用接口。真实调用可能产生费用。
-2. 退出 Unity Play。打开 step09 Console 给出的 `rag-settings.json`，只在本机将 `apiKey` 空字符串替换为自己的密钥。不要把密钥发到聊天中，也不要写进 C# 源码。
-3. 保留 `chatUrl=https://api.deepseek.com/chat/completions`、`chatModel=deepseek-flash`。
-4. ChatRoot 上移除 **RetrievalPreview 组件**，保留 ChatUI。源文件可以留存。
-5. 新建以下 4 个 C# 文件。所有文件内容写齐、编译通过后，才挂载 ChatController。
+第一版用 DeepSeek 官方 Chat Completions 接口，**非流式**请求。Python 端仍然只做检索，**不新增第二套 `/chat` 接口**——回答的组织完全放在 Unity 客户端完成。接口细节依据 [DeepSeek 官方说明](https://api-docs.deepseek.com/) 核对（核对日期 2026-09-17），默认模型 `deepseek-flash`，可以在本机配置里改。
 
-## 2. 新建 `Assets/Scripts/ChatModels.cs`
+## 一、准备密钥与场景
+
+1. 在 DeepSeek 官方平台创建自己的 API Key，确认账户能正常调用接口。真实调用可能会产生费用，注意控制测试次数。
+2. 退出 Unity Play。打开 step09 时 Console 打印出的 `rag-settings.json`，**只在这个本机文件里**把 `apiKey` 从空字符串换成你的真实密钥。不要把密钥发到聊天记录里，也不要写进任何 C# 源码文件。
+3. 保持 `chatUrl=https://api.deepseek.com/chat/completions`、`chatModel=deepseek-flash` 不变。
+4. `ChatRoot` 上移除 **RetrievalPreview 组件**，保留 `ChatUI`。源文件可以留着。
+5. 下面 4 个 C# 文件全部写完、确认编译通过之后，再挂载最后的 `ChatController`——半成品状态下挂载会导致场景里出现找不到引用的报错。
+
+## 二、新建 `Assets/Scripts/ChatModels.cs`
 
 <!-- file: unity-client/Assets/Scripts/ChatModels.cs -->
 ```csharp
@@ -63,9 +67,9 @@ public sealed class ChatResponse
 }
 ```
 
-这里关闭 thinking，先聚焦资料问答和非流式请求。`max_tokens` 限制输出长度，不是输入预算。`choices[0].message.content` 才是要显示的回答。
+这里显式关闭了 `thinking`，先把资料问答和非流式请求这两件事做扎实。`max_tokens` 限制的是**输出**长度，跟输入预算是两回事，不要混淆。真正要显示的内容是 `choices[0].message.content`。
 
-## 3. 新建 `Assets/Scripts/ChatClient.cs`
+## 三、新建 `Assets/Scripts/ChatClient.cs`
 
 <!-- file: unity-client/Assets/Scripts/ChatClient.cs -->
 ```csharp
@@ -101,11 +105,11 @@ public sealed class ChatClient
 }
 ```
 
-HTTP 401、429 等由 HttpJson 统一处理。不要把聊天 API 失败时的空字符串保存成正常的助手回答。
+HTTP 401（密钥错误）、429（限流）这些都由 `HttpJson`（step10 写的那个通用请求封装）统一处理，这里不用重复写。要留意的是 `finish_reason == "length"` 这个检查——如果回答是被截断的，绝对不能把这段不完整的文字当成正常回答存进历史。
 
-## 4. 新建 `Assets/Scripts/PromptBuilder.cs`
+## 四、新建 `Assets/Scripts/PromptBuilder.cs`
 
-这个类做三件事：补全简单追问、组装每轮资料、校验引用编号。它不执行联网搜索，也不假装知道原文以外的事实。
+这个类做三件事：**补全简单追问**、**组装每一轮的资料和提示词**、**校验模型输出的引用编号**。它不做联网搜索，也不假装知道原文以外的任何事实。
 
 <!-- file: unity-client/Assets/Scripts/PromptBuilder.cs -->
 ```csharp
@@ -163,7 +167,7 @@ public static class PromptBuilder
         if (Rules.Length + data.Length > 12000)
             throw new InvalidOperationException("本轮资料过长，请降低后端上下文预算");
         var recent = history.Skip(Math.Max(0, history.Count - 8)).ToList();
-        // 按成对消息删除，避免留下没有对应问题的旧答案。
+        // 按成对消息（一问一答）整体删除，避免留下没有对应问题的孤立旧答案。
         while (recent.Count > 0 && Rules.Length + data.Length + recent.Sum(m => m.content.Length) > 12000)
             recent.RemoveRange(0, Math.Min(2, recent.Count));
         var messages = new List<ChatMessage> { new ChatMessage("system", Rules) };
@@ -203,23 +207,23 @@ public static class PromptBuilder
 
     public static string ForHistory(string answer)
     {
-        // 旧编号没有跨轮意义，历史中去掉它们，也不保存检索原文。
+        // 旧编号没有跨轮次意义，历史里去掉它们，也不保存检索原文（避免历史越滚越大）。
         var text = Regex.Replace(answer, @"\[S\d+\]|\[来源编号无效\]", "");
         return text.Length <= 2000 ? text : text.Substring(0, 2000);
     }
 }
 ```
 
-### 关键解释
+### 关键代码解读
 
-- 来源用 JSON 序列化后放在本轮数据消息中，可信规则保持在 system 消息。提示词能约束模型，但不能保证绝对没有幻觉，所以后面必须评估。
-- `[S1]` 只属于本轮。历史里的旧来源编号去掉，避免模型把它误认为本轮来源。
-- 界面来源由 RagHit 生成，不信任模型自行输出的路径。
-- 12000 字符是本教程保守的应用预算，不是 token 计数。若换成上下文更小的模型，需要按其 tokenizer 重新限制。
-- 追问只支持合成校园资料中的四类主题，是明确可解释的第一版规则。没有确定主题时提问澄清；换业务文档时先扩展规则和测试，再考虑模型改写。
-- 多主题问题不会设置单一继承主题，避免下一句“它”被误指向其中一个对象。
+- **规则和数据分开放**：可信的系统规则放在 `system` 消息里，检索来的资料放在当轮的 `user` 消息里、且用 JSON 包起来。这是提示词工程里常见的"数据/指令隔离"思路——能降低模型被资料内容误导的概率，但**不能保证绝对没有幻觉**，所以后面 step12 一定要做真实评估，不能只靠这段提示词就当作"已解决"。
+- **`[S1]` 只在本轮有效**：历史消息里的旧编号会被清空（`ForHistory` 里的正则），避免模型把上一轮的 `[S1]` 和这一轮的 `[S1]` 搞混。
+- **界面来源永远来自 `RagHit`，不信任模型自己写的路径**——`SourcesText` 只是把模型引用的编号对应回真实检索结果，不会把模型输出里可能出现的文件名、网址直接显示出来。
+- **12000 字符是一个保守的应用层预算，不是精确的 token 计数**。如果以后换成上下文窗口更小的模型，需要按那个模型的 tokenizer 重新设定这个数字。
+- **追问识别是"显式规则"而不是"让模型自己猜"**：现在只覆盖合成校园资料里的四类主题（图书馆/食堂/校园卡/网络报修）。这是刻意的第一版简化——规则清楚、好测试、好排错。等接入真实业务文档时，需要先扩展这份规则表并补充测试，而不是急着上"用模型改写检索问题"这种更复杂的方案。
+- **多主题问题不设默认继承对象**：如果一句话同时提到"图书馆和食堂"，`topic` 会留空，这样下一句"它怎么样"不会被错误地继承到其中一个对象上——宁可多问用户一句，也不要猜错。
 
-## 5. 新建 `Assets/Scripts/ChatController.cs`
+## 五、新建 `Assets/Scripts/ChatController.cs`
 
 <!-- file: unity-client/Assets/Scripts/ChatController.cs -->
 ```csharp
@@ -321,15 +325,17 @@ public sealed class ChatController : MonoBehaviour
 }
 ```
 
-### 为什么不能只写一句“检索后调用模型”
+### 为什么这一步不能简化成"检索完调模型"一句话
 
-一次回答里有两个异步请求。用户可能在检索中取消，也可能在 DeepSeek 生成时提出新问题。轮次检查、同一取消源和 finally 清理确保旧任务不会覆盖新界面。只有成功且属于当前轮次的回答才写入历史。
+一次完整回答里其实有**两个**串行的异步请求（先检索、再聊天）。用户完全可能在检索还没返回时就取消，或者在 DeepSeek 生成过程中又提了个新问题。`generation` 轮次检查、复用同一个取消源、以及 `finally` 里的清理逻辑，三者一起保证了：**只有属于当前轮次、而且成功完成的回答，才会更新界面、才会写入历史**。这不是可有可无的"健壮性加分项"，去掉任何一个都会在真实使用中很快复现出 bug（比如快速连续提问导致答案错位）。
 
-当前历史只在内存中，退出 Play 就清空；这是第一版明确边界，不实现磁盘会话管理。
+当前的对话历史只存在内存里，退出 Play 就清空——这是第一版明确划定的边界，不做磁盘会话持久化。
 
-## 6. 先单独验证聊天接口，再接完整问答
+## 六、先单独验证聊天接口，再接完整问答
 
-完整教程代码提供后，可通过下面的临时脚本测试 DeepSeek。新建 `Assets/Scripts/ChatConnectionCheck.cs`，挂到临时空对象 `ConnectionCheck`。
+在挂载完整的 `ChatController` 之前，先用一个最小化的连通性测试确认密钥、网络、模型名都没问题——这样如果后面完整流程报错，你能排除"DeepSeek 这一层本身有没有问题"这个变量。
+
+新建 `Assets/Scripts/ChatConnectionCheck.cs`，挂到一个临时空对象 `ConnectionCheck` 上。
 
 <!-- file: unity-client/Assets/Scripts/ChatConnectionCheck.cs -->
 ```csharp
@@ -362,44 +368,44 @@ public sealed class ChatConnectionCheck : MonoBehaviour
 }
 ```
 
-1. 此时先不挂 ChatController，运行一次 Play，Console 应显示模型返回的“连接成功”或类似结果。
-2. 若失败，先修复密钥、余额、网络或模型名称。这个测试不访问本机检索服务。
-3. 退出 Play，**删除临时 ConnectionCheck 场景对象**，防止以后每次 Play 都自动产生测试请求；源文件可以保留。
-4. 在 ChatRoot 添加 ChatController，绑定 Ui，确认只剩 ChatUI 和 ChatController 两个业务组件。
-5. 启动本地 FastAPI，确认 `/ready`；进入 Play。
+1. 这时**先不要**挂 `ChatController`，运行一次 Play，Console 应该显示模型返回的"连接成功"或类似内容。
+2. 如果失败，先排查密钥、账户余额、网络、模型名称这几项。这个测试**不会**访问本机检索服务，所以失败一定和 DeepSeek 那一侧有关。
+3. 退出 Play，**删除临时的 ConnectionCheck 场景对象**，避免以后每次 Play 都自动发一次测试请求消耗额度；源文件可以留着。
+4. 在 `ChatRoot` 上添加 `ChatController`，绑定 Ui，确认场景里现在只剩 `ChatUI` 和 `ChatController` 这两个业务组件。
+5. 启动本地 FastAPI，确认 `/ready` 正常，再进入 Play。
 
-## 7. 完整问答验收
+## 七、完整问答验收
 
-按顺序手动验证：
+按顺序手动验证下面这张表，每一行都是在检验一个具体的设计点，不要跳着测：
 
 | 输入/操作 | 应观察到的行为 |
 | --- | --- |
-| 图书馆晚上几点关门？ | 回答 22:00，出现本轮来源编号，来源原文能核对 |
-| 它周日也开吗？ | 状态显示补全的图书馆问题，回答依据开放时间 |
-| 校园卡补办需要什么材料？ | 身份证和学生证，不能擅自增加照片等材料 |
-| 费用呢？ | 继承校园卡补办主题，回答 20 元 |
-| 明天天气怎么样？ | 资料未记载，明确说明不足，不编造天气 |
-| 刚进入 Play 就问“它在哪？” | 没有前置主题，应请求澄清 |
-| 生成过程中取消/提出新问题 | 旧回答不能覆盖新一轮，也不写入历史 |
-| API Key 临时留空 | 明确提示缺少本机配置，不能显示空的成功回答 |
+| 图书馆晚上几点关门？ | 回答 22:00，出现本轮来源编号，来源原文能核对上 |
+| 它周日也开吗？ | 状态显示补全后的图书馆问题，回答依据开放时间那段资料 |
+| 校园卡补办需要什么材料？ | 身份证和学生证，模型不应该自己加上"照片"之类的材料 |
+| 费用呢？ | 应该继承"校园卡补办"这个主题，回答 20 元 |
+| 明天天气怎么样？ | 资料没有记载，明确说明资料不足，不能编造天气 |
+| 刚进入 Play 就问"它在哪？" | 没有前置主题，应该要求澄清 |
+| 生成过程中取消/又提新问题 | 旧回答不能覆盖新一轮界面，也不应该写入历史 |
+| API Key 临时留空 | 应明确提示缺少本机配置，绝不能显示一个空白的"成功"回答 |
 
-无匹配阈值还没标定，所以未知问题可能先返回无关资料；模型仍应拒绝编造。若出现错误，将该问题记录到 step12 评估表，不把一次正确回答当成永久保证。
+无匹配阈值这时候还没标定（留到 step12），所以未知问题可能仍会先返回一些不相关的资料；但即便如此，模型也应该拒绝据此编造答案。如果出现异常表现，把这个问题记到 step12 的评估表里，**不要把一次偶然的正确回答当成永久保证**——LLM 输出本身有随机性，一次通过不代表下次也通过。
 
-## 8. 排查与验收清单
+## 八、排查与验收清单
 
 | 现象 | 原因与解决 |
 | --- | --- |
-| 401 | 检查本机 API Key，没有多余引号或空格；不要粘贴整个 Authorization 字段 |
-| 余额不足/限流 | 按官方错误信息处理；不要写无限重试造成重复请求 |
-| 修改密钥没生效 | 配置只在 Start 读取；退出 Play 再运行 |
-| 来源编号存在但事实不对 | 编号校验不验证语义；打开来源原文逐项比对 |
-| 问题切换后上下文混乱 | 确认历史不保存检索原文，且旧任务通过 generation 检查 |
-| 假数据还出现 | 检查 UiPreview、RetrievalPreview 是否仍挂载 |
+| 收到 401 | 检查本机 API Key 有没有多余的引号或空格；不要把整个 `Authorization: Bearer xxx` 字符串都粘进去，只填密钥本身 |
+| 余额不足 / 被限流 | 按官方返回的错误信息处理；不要写无限重试逻辑，那只会造成更多重复请求 |
+| 改了密钥没生效 | 配置只在 `Start()` 时读取一次；退出 Play 重新运行才会加载新值 |
+| 来源编号存在但事实说错了 | 编号校验只验证"这个编号是否存在"，不验证语义对不对；打开来源原文逐条核对 |
+| 连续追问后上下文乱了 | 确认历史里没有保存检索原文，且每次异步调用都在检查 `generation` |
+| 界面还在显示假数据 | 检查 `UiPreview`、`RetrievalPreview` 是不是还挂在场景上 |
 
-- [ ] 独立 DeepSeek 连通测试完成，临时对象已移除。
-- [ ] 完整 RAG 问答能显示来源与原文。
-- [ ] 追问有明确继承范围，无法确定时澄清。
-- [ ] 私人密钥不在源码或 Assets 中。
-- [ ] 没有知识依据时不把模型常识冒充知识库事实。
+- [ ] 独立的 DeepSeek 连通测试通过，临时对象已经删除。
+- [ ] 完整 RAG 问答能同时显示回答和来源。
+- [ ] 追问有明确的继承范围，无法判断时会主动澄清。
+- [ ] 私人密钥没有出现在源码或 Assets 里。
+- [ ] 没有知识依据的问题，模型不会拿常识冒充知识库事实。
 
 下一篇：[step12：评估、重启与打包](step12.md)。
