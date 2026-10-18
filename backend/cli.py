@@ -18,7 +18,7 @@ def main():
             if not hits:
                 print('没有找到相关资料')
             for i, hit in enumerate(hits, 1):
-                print(f'[{i}] {hit.score:.3f} {hit.score} {hit.section}')
+                print(f'[{i}] {hit.score:.3f}  {hit.source}  {hit.section}')
                 print('     ' + hit.text.replace('\n', ' '))
     finally:
         store.close()
